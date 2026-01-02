@@ -1,7 +1,6 @@
 import json
 import base64
 import urllib.parse
-import socket
 import subprocess
 import tempfile
 import os
@@ -13,10 +12,26 @@ import logging
 import asyncio
 from flask import Flask, request, jsonify, Response
 from typing import List, Dict, Optional, Tuple
-import random
-from urllib.parse import urlparse
-from urllib.error import HTTPError
 import httpx
+
+# 常量定义
+SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'ss', 'trojan', 'hysteria2')
+PROTOCOL_PREFIXES = tuple(f'{p}://' for p in SUPPORTED_PROTOCOLS)
+FILTERED_PORT = 53
+
+# 辅助函数
+def decode_base64_padded(content: str) -> str:
+    """解码 base64 内容，自动补全 padding"""
+    padding = '=' * (4 - len(content) % 4) if len(content) % 4 else ''
+    return base64.b64decode(content + padding).decode('utf-8')
+
+def is_valid_uri(uri: str) -> bool:
+    """检查是否为有效的代理 URI"""
+    return any(uri.startswith(prefix) for prefix in PROTOCOL_PREFIXES)
+
+def filter_valid_uris(uris: List[str]) -> List[str]:
+    """过滤出有效的代理 URI"""
+    return [u for u in uris if is_valid_uri(u)]
 
 # 配置日志
 os.makedirs('/app/output', exist_ok=True)
@@ -51,25 +66,24 @@ async def fetch_subscriptions(sub_urls: List[str]) -> List[str]:
             response = await client.get(url, timeout=10)
             response.raise_for_status()
             content = response.text.strip()
+            
             # 尝试 base64 解码
             try:
-                decoded = base64.b64decode(
-                    content + '=' * (4 - len(content) % 4)).decode('utf-8')
-                uris = [line.strip() for line in decoded.split('\n') if line.strip() and line.startswith(
-                    ('vmess://', 'vless://', 'ss://', 'trojan://', 'hysteria2://'))]
-            except:
+                decoded = decode_base64_padded(content)
+                lines = decoded.split('\n')
+            except (ValueError, UnicodeDecodeError, base64.binascii.Error):
                 # 非 base64，直接按行处理
-                uris = [line.strip() for line in content.split('\n') if line.strip() and line.startswith(
-                    ('vmess://', 'vless://', 'ss://', 'trojan://', 'hysteria2://'))]
+                lines = content.split('\n')
+            
+            uris = filter_valid_uris([line.strip() for line in lines if line.strip()])
             logging.info(f"从 {url} 获取 {len(uris)} 个节点")
             return set(uris)
-        except Exception as e:
+        except httpx.HTTPError as e:
             logging.error(f"订阅 {url} 获取失败: {e}")
             return set()
     
     all_uris = set()
     async with httpx.AsyncClient() as client:
-        # 并行获取所有订阅
         tasks = [fetch_single(url, client) for url in sub_urls]
         results = await asyncio.gather(*tasks)
         for result in results:
@@ -127,105 +141,201 @@ def modify_uri_name(uri: str, new_name: str) -> str:
     protocol = uri.split('://')[0]
     if protocol == 'vmess':
         try:
-            encoded_part = uri.split('://')[1]
-            decoded = base64.b64decode(
-                encoded_part + '=' * (4 - len(encoded_part) % 4)).decode('utf-8')
+            encoded_part = uri.split('://')[1].split('#')[0]
+            decoded = decode_base64_padded(encoded_part)
             config = json.loads(decoded)
             config['ps'] = new_name
             new_encoded = base64.b64encode(json.dumps(
                 config).encode('utf-8')).decode('utf-8').rstrip('=')
-            return f"vmess://{new_encoded}"
-        except Exception:
-            return uri + f"#{new_name}"
-    else:
-        if '#' not in uri:
-            return uri + f"#{new_name}"
-        else:
-            return uri.rsplit('#', 1)[0] + f"#{new_name}"
+            return f"vmess://{new_encoded}" + (f"#{new_name}" if '#' in uri else '')
+        except (ValueError, json.JSONDecodeError, KeyError):
+            pass
+    
+    # 其他协议：替换或追加 #name
+    if '#' not in uri:
+        return uri + f"#{new_name}"
+    return uri.rsplit('#', 1)[0] + f"#{new_name}"
+
+
+def extract_port_from_uri(uri: str) -> Optional[int]:
+    """从 URI 中提取端口号"""
+    try:
+        if not is_valid_uri(uri):
+            return None
+            
+        protocol = uri.split('://')[0]
+        encoded_part = uri.split('://')[1].split('#')[0]
+        
+        if protocol == 'vmess':
+            try:
+                decoded = decode_base64_padded(encoded_part)
+                config = json.loads(decoded)
+                return int(config['port'])
+            except (ValueError, json.JSONDecodeError, KeyError):
+                return None
+        
+        # vless, ss, trojan, hysteria2 使用 urlparse
+        parsed = urllib.parse.urlparse(f"{protocol}://{encoded_part}")
+        return parsed.port
+    except (ValueError, AttributeError):
+        return None
 
 
 def parse_proxy_uri_to_xray_config(uri: str) -> Optional[Dict]:
     """解析 URI 到 Xray JSON 配置。"""
-    if not uri.startswith(('vmess://', 'vless://', 'ss://', 'trojan://', 'hysteria2://')):
+    if not is_valid_uri(uri):
         return None
 
     protocol = uri.split('://')[0]
-    encoded_part = uri.split('://')[1]
+    encoded_part = uri.split('://')[1].split('#')[0]
 
     try:
         outbound = {'protocol': protocol.upper()}
         if protocol == 'vmess':
-            decoded = base64.b64decode(
-                encoded_part + '=' * (4 - len(encoded_part) % 4)).decode('utf-8')
+            decoded = decode_base64_padded(encoded_part)
             config = json.loads(decoded)
             outbound['settings'] = {'vnext': [{'address': config['add'], 'port': int(config['port']), 'users': [
                 {'id': config['id'], 'alterId': config.get('aid', 0), 'security': config.get('scy', 'auto')}]}]}
-            outbound['streamSettings'] = {'network': config.get(
-                'net', 'tcp'), 'security': config.get('tls', '')}
+            outbound['streamSettings'] = {'network': config.get('net', 'tcp'), 'security': config.get('tls', '')}
             if config.get('tls') == 'tls':
-                outbound['streamSettings']['tlsSettings'] = {
-                    'serverName': config.get('host', config['add'])}
+                outbound['streamSettings']['tlsSettings'] = {'serverName': config.get('host', config['add'])}
+                
         elif protocol == 'vless':
             parsed = urllib.parse.urlparse(f"{protocol}://{encoded_part}")
-            uuid = parsed.username
-            host = parsed.hostname
-            port = parsed.port
             params = urllib.parse.parse_qs(parsed.query)
-            outbound['settings'] = {'vnext': [{'address': host, 'port': int(
-                port), 'users': [{'id': uuid, 'encryption': params.get('encryption', ['none'])[0]}]}]}
-            outbound['streamSettings'] = {'network': params.get(
-                'type', ['tcp'])[0], 'security': params.get('security', ['none'])[0]}
-            if 'tls' in params.get('security', []):
-                outbound['streamSettings']['tlsSettings'] = {
-                    'serverName': params.get('sni', [host])[0]}
+            outbound['settings'] = {'vnext': [{'address': parsed.hostname, 'port': int(parsed.port),
+                'users': [{'id': parsed.username, 'encryption': params.get('encryption', ['none'])[0]}]}]}
+            
+            # 处理传输层配置
+            network = params.get('type', ['tcp'])[0]
+            security = params.get('security', ['none'])[0]
+            stream_settings = {'network': network, 'security': security}
+            
+            # TLS配置
+            if security == 'tls':
+                stream_settings['tlsSettings'] = {'serverName': params.get('sni', [parsed.hostname])[0]}
+                if params.get('fp'):
+                    stream_settings['tlsSettings']['fingerprint'] = params['fp'][0]
+                if params.get('allowInsecure'):
+                    stream_settings['tlsSettings']['allowInsecure'] = params['allowInsecure'][0] == '1'
+            
+            # Reality配置
+            elif security == 'reality':
+                stream_settings['realitySettings'] = {
+                    'serverName': params.get('sni', [parsed.hostname])[0],
+                    'publicKey': params.get('pbk', [''])[0],
+                    'shortId': params.get('sid', [''])[0],
+                    'serverNames': [params.get('servername', [params.get('sni', [parsed.hostname])[0]])[0]],
+                    'spiderX': params.get('spx', ['/'])[0],
+                    'fingerprint': params.get('fp', ['chrome'])[0]
+                }
+            
+            # WebSocket配置
+            if network == 'ws':
+                stream_settings['wsSettings'] = {
+                    'path': urllib.parse.unquote(params.get('path', ['/'])[0])
+                }
+                if params.get('host'):
+                    stream_settings['wsSettings']['headers'] = {'Host': params['host'][0]}
+            
+            # gRPC配置
+            elif network == 'grpc':
+                stream_settings['grpcSettings'] = {
+                    'serviceName': params.get('serviceName', [''])[0],
+                    'multiMode': params.get('mode', ['auto'])[0] == 'multi'
+                }
+            
+            # XHTTP配置
+            elif network == 'xhttp':
+                stream_settings['xhttpSettings'] = {
+                    'path': urllib.parse.unquote(params.get('path', [''])[0]),
+                    'mode': params.get('mode', ['auto'])[0]
+                }
+                if params.get('host'):
+                    stream_settings['xhttpSettings']['host'] = params['host'][0]
+            
+            outbound['streamSettings'] = stream_settings
+                
         elif protocol == 'ss':
             parts = encoded_part.split('@')
             if len(parts) < 2:
                 return None
             method_pass = parts[0]
             if ':' not in method_pass:
-                method_pass_b64 = method_pass + \
-                    '=' * (4 - len(method_pass) % 4)
-                method_pass = base64.b64decode(method_pass_b64).decode('utf-8')
+                method_pass = decode_base64_padded(method_pass)
             method, password = method_pass.split(':', 1)
-            host_port = parts[1]
-            host, port = host_port.split(':')
-            outbound['settings'] = {'servers': [
-                {'address': host, 'port': int(port), 'method': method, 'password': password}]}
+            host, port = parts[1].split(':')
+            outbound['settings'] = {'servers': [{'address': host, 'port': int(port), 'method': method, 'password': password}]}
+            
         elif protocol == 'trojan':
             parsed = urllib.parse.urlparse(f"{protocol}://{encoded_part}")
-            password = parsed.username
-            host = parsed.hostname
-            port = parsed.port
             params = urllib.parse.parse_qs(parsed.query)
-            outbound['settings'] = {'servers': [
-                {'address': host, 'port': int(port), 'password': password}]}
-            outbound['streamSettings'] = {'network': 'tcp', 'security': 'tls', 'tlsSettings': {
-                'serverName': params.get('sni', [host])[0]}}
+            outbound['settings'] = {'servers': [{'address': parsed.hostname, 'port': int(parsed.port), 'password': parsed.username}]}
+            
+            # 处理传输层配置
+            network = params.get('type', ['tcp'])[0]
+            stream_settings = {'network': network}
+            
+            # 安全设置
+            security = params.get('security', ['none'])[0]
+            if security == 'tls':
+                stream_settings['security'] = 'tls'
+                stream_settings['tlsSettings'] = {'serverName': params.get('sni', [parsed.hostname])[0]}
+                if params.get('fp'):
+                    stream_settings['tlsSettings']['fingerprint'] = params['fp'][0]
+                if params.get('allowInsecure'):
+                    stream_settings['tlsSettings']['allowInsecure'] = params['allowInsecure'][0] == '1'
+            
+            # WebSocket配置
+            if network == 'ws':
+                stream_settings['wsSettings'] = {
+                    'path': params.get('path', ['/'])[0]
+                }
+                if params.get('host'):
+                    stream_settings['wsSettings']['headers'] = {'Host': params['host'][0]}
+            
+            outbound['streamSettings'] = stream_settings
+            
         elif protocol == 'hysteria2':
             parsed = urllib.parse.urlparse(f"{protocol}://{encoded_part}")
-            password = parsed.username
-            host = parsed.hostname
-            port = parsed.port
             params = urllib.parse.parse_qs(parsed.query)
-            outbound['settings'] = {'servers': [
-                {'address': host, 'port': int(port), 'password': password}]}
-            outbound['streamSettings'] = {'network': 'hysteria2'}
+            
+            # 处理IPv6地址 - 去除方括号
+            hostname = parsed.hostname
+            if hostname and hostname.startswith('[') and hostname.endswith(']'):
+                hostname = hostname[1:-1]
+            
+            outbound['settings'] = {'servers': [{'address': hostname, 'port': int(parsed.port), 'password': parsed.username}]}
+            outbound['streamSettings'] = {'network': 'hysteria2', 'security': 'tls'}
+            
+            # TLS/SNI配置 - Hysteria2必需TLS
+            outbound['streamSettings']['tlsSettings'] = {
+                'serverName': params.get('sni', [hostname])[0],
+                'allowInsecure': params.get('insecure', ['0'])[0] == '1'
+            }
+            if params.get('fp'):
+                outbound['streamSettings']['tlsSettings']['fingerprint'] = params['fp'][0]
+            
+            # Hysteria2特定配置
+            hysteria2_settings = {}
             if 'obfs' in params:
-                outbound['streamSettings']['hysteria2Settings'] = {'obfs': {
-                    'type': params['obfs'][0], 'obfsPassword': params.get('obfs-password', [''])[0]}}
+                hysteria2_settings['obfs'] = params['obfs'][0]
+                hysteria2_settings['obfs-password'] = params.get('obfs-password', [''])[0]
+            
+            if hysteria2_settings:
+                outbound['streamSettings']['hysteria2Settings'] = hysteria2_settings
         else:
             return None
 
-        port = get_free_port()
+        local_port = get_free_port()
         config = {
-            "inbounds": [{"port": port, "protocol": "socks", "settings": {"auth": "noauth", "udp": True}, "listen": "127.0.0.1"}],
+            "inbounds": [{"port": local_port, "protocol": "socks", "settings": {"auth": "noauth", "udp": True}, "listen": "127.0.0.1"}],
             "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
             "routing": {"rules": [{"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]}]}
         }
         config['outbounds'][0]['tag'] = 'proxy'
-        return {'config': config, 'port': port, 'uri': uri}
-    except Exception as e:
+        return {'config': config, 'port': local_port, 'uri': uri}
+    except (ValueError, json.JSONDecodeError, KeyError, AttributeError) as e:
         logging.error(f"解析 URI 异常 ({uri[:30]}...): {e}")
         return None
 
@@ -247,7 +357,7 @@ async def start_xray_and_test(config_info: Dict, xray_path: str = 'xray', timeou
         await asyncio.sleep(2)
 
         # 使用 httpx 异步查询出口 IP
-        async with httpx.AsyncClient(proxies=f'socks5://127.0.0.1:{port}') as client:
+        async with httpx.AsyncClient(proxy=f'socks5://127.0.0.1:{port}') as client:
             response = await client.get(
                 'http://ip-api.com/json?fields=status,query', timeout=timeout)
 
@@ -296,16 +406,38 @@ async def start_xray_and_test(config_info: Dict, xray_path: str = 'xray', timeou
 
 
 async def process_batch(uris: List[str], max_workers: int = 4, xray_path: str = 'xray', include_details: bool = False, prefix: str = '') -> Tuple[List[Dict], str, int, int]:
-    """异步处理批量节点（默认并发 4 + 延时）。"""
+    """异步处理批量节点（默认并发 4 + 延时），过滤53端口的节点。"""
     results = []
     new_uris = []
     semaphore = asyncio.Semaphore(max_workers)
 
-    async def process_single(uri, index):
+    async def process_single(uri: str, index: int) -> Dict:
         async with semaphore:
+            protocol = uri.split('://')[0] if '://' in uri else '未知'
+            uri_preview =  uri
+            port = extract_port_from_uri(uri)
+            
+            # 过滤53端口的节点
+            if port == FILTERED_PORT:
+                logging.info(f"[{index + 1}/{len(uris)}] 过滤53端口节点 | 协议={protocol} | 端口={port} | URI={uri_preview}")
+                return {
+                    'original_uri': uri,
+                    'protocol': protocol,
+                    'status': '已过滤(53端口)',
+                    'reachable': False,
+                    'new_uri': uri
+                }
+            
             config_info = parse_proxy_uri_to_xray_config(uri)
             if not config_info:
-                return {'original_uri': uri, 'status': 'URI 解析失败', 'reachable': False, 'new_uri': uri}
+                logging.warning(f"[{index + 1}/{len(uris)}] URI解析失败 | 协议={protocol} | 端口={port} | URI={uri_preview}")
+                return {
+                    'original_uri': uri,
+                    'protocol': protocol,
+                    'status': 'URI 解析失败',
+                    'reachable': False,
+                    'new_uri': uri
+                }
 
             result = await start_xray_and_test(config_info, xray_path)
             if result['reachable'] and result['countryCode'] != '未知' and result['region'] != '未知':
@@ -314,9 +446,20 @@ async def process_batch(uris: List[str], max_workers: int = 4, xray_path: str = 
                 result['new_name'] = new_name
                 result['new_uri'] = new_uri
                 new_uris.append(new_uri)
+                
+                # 记录成功节点信息
+                logging.info(
+                    f"[{index + 1}/{len(uris)}] 测试成功 | 协议={result['protocol']} | 端口={port} | "
+                    f"出口IP={result['exit_ip']} | 国家={result['countryCode']}-{result['region']} | "
+                    f"新名称={new_name} | 本地端口={result['local_port']} | URI={uri_preview}")
             else:
                 result['new_uri'] = result['original_uri']
                 new_uris.append(result['original_uri'])
+                
+                # 记录失败节点信息
+                logging.warning(
+                    f"[{index + 1}/{len(uris)}] 测试失败 | 协议={result['protocol']} | 端口={port} | "
+                    f"状态={result['status']} | 本地端口={result.get('local_port', 'N/A')} | URI={uri_preview}")
 
             return result
 
@@ -327,26 +470,16 @@ async def process_batch(uris: List[str], max_workers: int = 4, xray_path: str = 
     for task in asyncio.as_completed(tasks):
         result = await task
         results.append(result)
-
         # 限流延时：每请求 1.5s
         await asyncio.sleep(1.5)
-
-        if result['reachable']:
-            logging.info(
-                f"节点 {result['protocol']} ({result['original_uri'][:30]}...): 出口IP={result['exit_ip']}, 国家={result['countryCode']}-{result['region']}, 新名称={result.get('new_name', '未修改')}, 状态={result['status']}")
-        else:
-            logging.warning(
-                f"节点 {result['protocol']} ({result['original_uri'][:30]}...): 状态={result['status']}")
 
     # 生成新订阅 base64（仅成功节点）
     successful_new_uris = [r['new_uri'] for r in results if r['reachable']]
     new_sub_content = '\n'.join(successful_new_uris)
-    new_sub_b64 = base64.b64encode(
-        new_sub_content.encode('utf-8')).decode('utf-8')
+    new_sub_b64 = base64.b64encode(new_sub_content.encode('utf-8')).decode('utf-8')
 
     total_nodes = len(uris)
     success_count = len(successful_new_uris)
-
     logging.info(f"处理完成: {total_nodes} 个节点，新订阅包含 {success_count} 个成功节点。")
 
     return results, new_sub_b64, total_nodes, success_count
@@ -439,8 +572,11 @@ def webhook_process():
             logging.info(f"Webhook 返回: {success_count}/{total_nodes} 成功")
             return jsonify(response)
 
+        except (KeyError, TypeError) as e:
+            logging.error(f"Webhook 数据解析异常: {e}")
+            return jsonify({'error': f'Invalid request data: {e}'}), 400
         except Exception as e:
-            logging.error(f"Webhook 异常: {e}")
+            logging.error(f"Webhook 异常: {e}", exc_info=True)
             return jsonify({'error': str(e)}), 500
 
     return asyncio.run(async_webhook_logic())
@@ -487,7 +623,6 @@ if __name__ == "__main__":
         '--mode', choices=['webhook'], default='webhook', help="运行模式: webhook (API + 定时)")
     parser.add_argument('--port', type=int, default=5000, help="Webhook 端口")
     parser.add_argument('--api_key', type=str, help="API Key")
-    parser.add_argument('--prefix', type=str, default='', help="节点名称前缀（如：ICY-）")
 
     args = parser.parse_args()
 
