@@ -1,0 +1,20 @@
+
+version: '3.8'
+
+services:
+  proxy-tester:
+    # 镜像名称 - 可以在这里修改为自定义名称
+    image: proxy-rename
+    
+    build:
+      context: .
+      dockerfile: dockerfile
+    
+    container_name: proxy-rename
+    volumes:
+      - ./app:/app  # 输出目录（保存数据）
+    environment:
+      - API_KEY=xynet  # Webhook API Key
+    ports:
+      - "5005:5005"  # API 端口
+    command: ["python", "proxy_test_exit_ip.py", "--sub_urls", "/app/subs.txt", "--interval_hours", "24", "--mode", "webhook", "--port", "5005", "--max_workers", "3", "--prefix", "ICY-"]
