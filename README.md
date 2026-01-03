@@ -1,6 +1,8 @@
 # Proxy Rename
 
-Proxy Rename 是一个基于 Python 与 Xray-core 的代理节点批量测试工具。它可以从订阅 URL 获取节点（支持 VMess / VLESS / Shadowsocks / Trojan / Hysteria2），通过本地 Xray 代理逐一测试出口 IP 与地理信息，自动重命名节点并生成可直接导入的 base64 订阅。
+Proxy Rename 是一个基于 Python 与 sing-box 的代理节点批量测试工具。它可以从订阅 URL 获取节点（支持 VMess / VLESS / Shadowsocks / Trojan / Hysteria2），通过本地 sing-box 代理逐一测试出口 IP 与地理信息，自动重命名节点并生成可直接导入的 base64 订阅。
+
+> **重要更新**：项目已从 Xray-core 迁移到 sing-box，以获得更好的 Hysteria2 协议支持和统一的配置格式。
 
 ---
 
@@ -17,11 +19,11 @@ Proxy Rename 是一个基于 Python 与 Xray-core 的代理节点批量测试工
 
 ## 先决条件
 
-- Docker >= 20.10, Docker Compose >= v2.0（或在目标环境直接安装 Python 运行）。
-- Xray-core 二进制在容器内可用，或通过 `--xray_path` 指定路径。
-- Python >= 3.12
-- 若通过 socks5 代理进行测试，httpx 已内置 socks 支持。
-- 订阅文件（可选）：每行一个订阅 URL，例如 `subs.txt`。
+- Docker >= 20.10, Docker Compose >= v2.0（或在目标环境直接安装 Python 运行）
+- sing-box 二进制在容器内可用，或通过 `--singbox_path` 指定路径
+- Python >= 3.11
+- 若通过 socks5 代理进行测试，httpx 已内置 socks 支持
+- 订阅文件（可选）：每行一个订阅 URL，例如 `subs.txt`
 
 ## 快速启动（Docker Compose）
 

@@ -1,0 +1,82 @@
+name: Proxy Node Testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      sub_urls:
+        description: '订阅链接（逗号分隔）'
+        required: true
+        type: string
+      prefix:
+        description: '节点名称前缀'
+        required: false
+        type: string
+        default: ''
+      max_workers:
+        description: '并发数'
+        required: false
+        type: number
+        default: 4
+  schedule:
+    # 每天北京时间 02:00 执行
+    - cron: '0 18 * * *'
+
+env:
+  SINGBOX_VERSION: '1.10.0'
+
+jobs:
+  test-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install sing-box
+        run: |
+          wget https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz
+          tar -xzf sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz
+          sudo mv sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box /usr/local/bin/
+          sing-box version
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install flask httpx schedule
+
+      - name: Create subscription file
+        run: |
+          mkdir -p /tmp/subs
+          echo "${{ github.event.inputs.sub_urls }}" | tr ',' '\n' > /tmp/subs/subs.txt
+
+      - name: Run proxy testing
+        run: |
+          python proxy_test_exit_ip.py \
+            --mode cli \
+            --sub_urls /tmp/subs/subs.txt \
+            --prefix "${{ github.event.inputs.prefix }}" \
+            --max_workers ${{ github.event.inputs.max_workers }} \
+            --output_dir ./output
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-test-results-${{ github.run_number }}
+          path: output/
+          retention-days: 7
+
+      - name: Create summary
+        run: |
+          if [ -f output/results_*.json ]; then
+            echo "## 测试结果摘要" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat output/results_*.json | python -m json.tool >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

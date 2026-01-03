@@ -10,11 +10,12 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 下载并安装 Xray-core（最新版 v25.12.8）
-RUN wget https://github.com/XTLS/Xray-core/releases/download/v25.12.8/Xray-linux-64.zip \
-    && unzip Xray-linux-64.zip -d /usr/local/bin/ \
-    && chmod +x /usr/local/bin/xray \
-    && rm Xray-linux-64.zip
+# 下载并安装 sing-box（支持 Hysteria2 的最新版本）
+RUN wget https://github.com/SagerNet/sing-box/releases/download/v1.10.0/sing-box-1.10.0-linux-amd64.tar.gz \
+    && tar -xzf sing-box-1.10.0-linux-amd64.tar.gz \
+    && mv sing-box-1.10.0-linux-amd64/sing-box /usr/local/bin/ \
+    && chmod +x /usr/local/bin/sing-box \
+    && rm -rf sing-box-1.10.0-linux-amd64.tar.gz sing-box-1.10.0-linux-amd64
 
 # 复制依赖文件和 Python 脚本
 COPY proxy_test_exit_ip.py /app/
