@@ -10,3 +10,4 @@ subs.txt
 
 # Virtual environments
 .venv
+.trae/
